@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 
@@ -141,6 +141,15 @@ def get_stats(conn: sqlite3.Connection) -> dict:
         "latest_count": latest_row["device_count"] if latest_row else 0,
         "latest_time": latest_row["timestamp"] if latest_row else None,
     }
+
+
+def get_scan_history(conn: sqlite3.Connection, hours: int = 3) -> list[dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    rows = conn.execute(
+        "SELECT timestamp, device_count FROM scan_sessions WHERE timestamp >= ? ORDER BY timestamp",
+        (cutoff,),
+    ).fetchall()
+    return [{"t": row["timestamp"], "c": row["device_count"]} for row in rows]
 
 
 def reset_session(conn: sqlite3.Connection) -> None:
