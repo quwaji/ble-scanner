@@ -113,7 +113,7 @@ async def run_server(conn, port: int = 8080) -> None:
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logging.getLogger(__name__).info("Web UI ready: http://ugopi2026.local:%d/", port)
+    logging.getLogger(__name__).info("Web UI ready: http://raspberrypi.local:%d/", port)
     await asyncio.Event().wait()
 
 

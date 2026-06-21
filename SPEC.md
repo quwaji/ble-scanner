@@ -92,14 +92,20 @@ ble_scanner/
 WebUIのログパネルにも同時表示される（直近200行）。
 
 ```
-[NEW]  78:F5:05:9B:C8:56  SX70KAJI                 -65 dBm  near
-[UPD]  78:F5:05:9B:C8:56  SX70KAJI                 -72 dBm  medium
-[LOST] 78:F5:05:9B:C8:56  SX70KAJI                 (last seen: 2026-06-20T12:34:56)
+[NEW]  AA:BB:CC:DD:EE:FF  MyDevice                 -65 dBm  near
+[UPD]  AA:BB:CC:DD:EE:FF  MyDevice                 -72 dBm  medium
+[LOST] AA:BB:CC:DD:EE:FF  MyDevice                 (last seen: 2026-01-01T12:34:56)
 ```
 
 - `[NEW]`  : 初回検出デバイス
 - `[UPD]`  : 既知デバイスの再検出（LOSTから復帰した場合も [UPD]）
 - `[LOST]` : 一定時間（デフォルト10分）検出されなくなったデバイス
+
+> **注意: MAC Address Randomization について**
+> スマートフォン等は約15分ごとにBLEアドバタイズ用のMACアドレスをランダムに変更する
+> （Resolvable Private Address）。このため、同一の物理デバイスが時間の経過とともに
+> 別の `[NEW]` デバイスとして記録され、累積検出デバイス数が実際の物理台数より
+> 多くなることがある。固定MACを持つデバイス（センサー類・ビーコン等）は影響を受けない。
 
 ## WebUI
 
@@ -156,7 +162,7 @@ journalctl -u ble-scanner -f   # ログ確認
 
 ```bash
 # ファイル転送
-scp -r ble_scanner/ qatester@ugopi2026.local:~/
+scp -r ble_scanner/ pi@raspberrypi.local:~/
 
 # 依存ライブラリ (RPi OS)
 pip install bleak aiohttp --break-system-packages

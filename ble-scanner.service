@@ -4,8 +4,8 @@ After=network-online.target bluetooth.target
 Wants=network-online.target
 
 [Service]
-User=qatester
-WorkingDirectory=/home/qatester/ble_scanner
+User=pi
+WorkingDirectory=/home/pi/ble_scanner
 ExecStartPre=/usr/sbin/rfkill unblock bluetooth
 ExecStartPre=/bin/sh -c 'for i in 1 2 3 4 5; do hciconfig hci0 up 2>/dev/null && break; sleep 2; done'
 ExecStart=/usr/bin/python3 main.py
