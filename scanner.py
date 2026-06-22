@@ -1,14 +1,30 @@
 import asyncio
 import logging
 import sqlite3
+
 from bleak import BleakScanner
+from bleak.assigned_numbers import AdvertisementDataType
+from bleak.backends.bluezdbus.advertisement_monitor import OrPattern
+from bleak.backends.bluezdbus.scanner import BlueZScannerArgs
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
+from bleak.exc import BleakError
 
 import config
 import db
 
 logger = logging.getLogger(__name__)
+
+# Passive scanning needs at least one advertisement-monitor pattern. Matching on
+# the common Flags values catches the large majority of advertising BLE devices
+# (phones, wearables, beacons, TVs) without the active-discovery start/stop churn
+# that wedges the adapter on this hardware. Devices that omit the Flags AD
+# structure entirely won't match; add manufacturer/service-data patterns here if
+# any expected device is missing.
+_PASSIVE_PATTERNS = [
+    OrPattern(0, AdvertisementDataType.FLAGS, bytes([flags]))
+    for flags in (0x02, 0x04, 0x05, 0x06, 0x18, 0x1a, 0x1b)
+]
 
 
 def rssi_label(rssi: int | None) -> str:
@@ -19,22 +35,6 @@ def rssi_label(rssi: int | None) -> str:
     if rssi > -80:
         return "medium"
     return "far"
-
-
-async def run_scan() -> dict[str, tuple[str | None, int | None]]:
-    """Scan for SCAN_DURATION seconds. Returns {mac: (name, best_rssi)}."""
-    detected: dict[str, tuple[str | None, int | None]] = {}
-
-    def callback(device: BLEDevice, adv: AdvertisementData) -> None:
-        mac = device.address.upper()
-        existing_rssi = detected.get(mac, (None, None))[1]
-        if existing_rssi is None or (adv.rssi is not None and adv.rssi > existing_rssi):
-            detected[mac] = (device.name or None, adv.rssi)
-
-    async with BleakScanner(detection_callback=callback):
-        await asyncio.sleep(config.SCAN_DURATION)
-
-    return detected
 
 
 def log_results(detected: dict[str, tuple[str | None, int | None]], db_results: dict[str, bool]) -> None:
@@ -48,28 +48,66 @@ def log_results(detected: dict[str, tuple[str | None, int | None]], db_results: 
         logger.info("%-6s %-17s  %-24s  %s  %s", tag, mac, display_name, rssi_str, label)
 
 
+def _record_window(conn: sqlite3.Connection, window: dict[str, tuple[str | None, int | None]]) -> None:
+    db_results: dict[str, bool] = {}
+    for mac, (name, rssi) in window.items():
+        is_new = db.upsert_device(conn, mac, name, rssi)
+        db.record_scan_event(conn, mac, rssi)
+        db_results[mac] = is_new
+
+    logger.info("--- Found %d device(s) ---", len(window))
+    log_results(window, db_results)
+    db.record_scan_session(conn, len(window))
+
+    lost = db.get_newly_lost_devices(conn, config.LOST_THRESHOLD)
+    for row in lost:
+        display_name = row["name"] or "(unknown)"
+        logger.info("[LOST] %-17s  %-24s  (last seen: %s)", row["mac"], display_name, row["last_seen"])
+        db.mark_lost_notified(conn, row["mac"])
+
+
 async def scan_loop(conn: sqlite3.Connection) -> None:
-    logger.info("BLE scanner started. interval=%ds duration=%ds lost_threshold=%ds",
-                config.SCAN_INTERVAL, int(config.SCAN_DURATION), config.LOST_THRESHOLD)
-    while True:
-        logger.info("--- Scanning for %.0f seconds ---", config.SCAN_DURATION)
-        detected = await run_scan()
+    logger.info("BLE scanner started (passive). interval=%ds lost_threshold=%ds",
+                config.SCAN_INTERVAL, config.LOST_THRESHOLD)
 
-        db_results: dict[str, bool] = {}
-        for mac, (name, rssi) in detected.items():
-            is_new = db.upsert_device(conn, mac, name, rssi)
-            db.record_scan_event(conn, mac, rssi)
-            db_results[mac] = is_new
+    # Best RSSI/name seen per MAC during the current interval window. The callback
+    # runs on the event loop, so no locking is needed around this dict.
+    detected: dict[str, tuple[str | None, int | None]] = {}
 
-        logger.info("--- Found %d device(s) ---", len(detected))
-        log_results(detected, db_results)
-        db.record_scan_session(conn, len(detected))
+    def callback(device: BLEDevice, adv: AdvertisementData) -> None:
+        mac = device.address.upper()
+        name = adv.local_name or device.name or None
+        existing_rssi = detected.get(mac, (None, None))[1]
+        if existing_rssi is None or (adv.rssi is not None and adv.rssi > existing_rssi):
+            detected[mac] = (name, adv.rssi)
 
-        lost = db.get_newly_lost_devices(conn, config.LOST_THRESHOLD)
-        for row in lost:
-            display_name = row["name"] or "(unknown)"
-            logger.info("[LOST] %-17s  %-24s  (last seen: %s)", row["mac"], display_name, row["last_seen"])
-            db.mark_lost_notified(conn, row["mac"])
+    # One passive monitor, started once and kept running. Unlike active discovery,
+    # passive scanning re-delivers advertisements continuously, so the callback
+    # keeps firing and each window's snapshot reflects the devices present then.
+    scanner = BleakScanner(
+        detection_callback=callback,
+        scanning_mode="passive",
+        bluez=BlueZScannerArgs(or_patterns=_PASSIVE_PATTERNS),
+    )
+    try:
+        await scanner.start()
+    except BleakError as e:
+        logger.error(
+            "Passive scan start failed (needs bleak>=0.19 and BlueZ "
+            "'Experimental = true'): %s", e,
+        )
+        logger.error("Scanning disabled; web UI stays up.")
+        return
 
-        logger.info("--- Next scan in %ds ---", config.SCAN_INTERVAL)
-        await asyncio.sleep(config.SCAN_INTERVAL)
+    logger.info("--- Passive monitoring started, sampling every %ds ---", config.SCAN_INTERVAL)
+    try:
+        while True:
+            await asyncio.sleep(config.SCAN_INTERVAL)
+            window = dict(detected)
+            detected.clear()
+            _record_window(conn, window)
+    finally:
+        try:
+            await scanner.stop()
+        except BleakError as e:
+            logger.warning("scanner.stop() failed (ignored): %s", e)
