@@ -55,62 +55,84 @@ def _init(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def upsert_device(conn: sqlite3.Connection, mac: str, name: str | None, rssi: int | None) -> bool:
-    """Insert or update a device. Returns True if the device is new.
-    Resets lost_notified when a previously lost device reappears."""
+def record_window(
+    conn: sqlite3.Connection,
+    detected: dict[str, tuple[str | None, int | None]],
+    lost_threshold_seconds: int,
+) -> tuple[set[str], list[sqlite3.Row]]:
+    """Persist one scan window in a single transaction.
+
+    Committing once per device made the cost of a window scale with the number
+    of devices; on slow hardware that let recording outrun the scan interval and
+    snowball (the window kept growing, so each window had even more devices).
+    Batching every insert/update into one transaction keeps a window to a single
+    commit regardless of how many devices were seen.
+
+    Returns (new_macs, newly_lost_rows) so the caller can log them.
+    """
     ts = now_iso()
-    existing = conn.execute("SELECT mac FROM devices WHERE mac = ?", (mac,)).fetchone()
-    if existing is None:
-        conn.execute(
-            "INSERT INTO devices (mac, name, first_seen, last_seen, scan_count, last_rssi, lost_notified) "
-            "VALUES (?, ?, ?, ?, 1, ?, 0)",
-            (mac, name, ts, ts, rssi),
+    macs = list(detected)
+
+    # Which of these MACs are already known? Look them up in chunks to stay well
+    # under SQLite's bound-parameter limit.
+    existing: set[str] = set()
+    for i in range(0, len(macs), 500):
+        chunk = macs[i:i + 500]
+        placeholders = ",".join("?" * len(chunk))
+        existing.update(
+            row[0]
+            for row in conn.execute(
+                f"SELECT mac FROM devices WHERE mac IN ({placeholders})", chunk
+            )
         )
-        conn.commit()
-        return True
-    else:
+    new_macs = {mac for mac in macs if mac not in existing}
+
+    inserts = [(mac, detected[mac][0], ts, ts, detected[mac][1]) for mac in new_macs]
+    updates = [(detected[mac][0], ts, detected[mac][1], mac) for mac in existing]
+    events = [(mac, ts, detected[mac][1]) for mac in macs]
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=lost_threshold_seconds)
+    ).isoformat()
+
+    with conn:  # one transaction -> one commit
+        if inserts:
+            conn.executemany(
+                "INSERT INTO devices (mac, name, first_seen, last_seen, scan_count, last_rssi, lost_notified) "
+                "VALUES (?, ?, ?, ?, 1, ?, 0)",
+                inserts,
+            )
+        if updates:
+            conn.executemany(
+                "UPDATE devices SET name = COALESCE(?, name), last_seen = ?, "
+                "scan_count = scan_count + 1, last_rssi = ?, lost_notified = 0 WHERE mac = ?",
+                updates,
+            )
+        if events:
+            conn.executemany(
+                "INSERT INTO scan_events (mac, timestamp, rssi) VALUES (?, ?, ?)",
+                events,
+            )
         conn.execute(
-            "UPDATE devices SET name = COALESCE(?, name), last_seen = ?, "
-            "scan_count = scan_count + 1, last_rssi = ?, lost_notified = 0 WHERE mac = ?",
-            (name, ts, rssi, mac),
+            "INSERT INTO scan_sessions (timestamp, device_count) VALUES (?, ?)",
+            (ts, len(detected)),
         )
-        conn.commit()
-        return False
+        # Devices seen this window just had last_seen bumped to ts, so only
+        # genuinely absent devices fall before the cutoff. last_seen is an
+        # ISO-8601 UTC string, so a lexicographic compare matches a chronological
+        # one.
+        lost = conn.execute(
+            "SELECT mac, name, last_seen FROM devices "
+            "WHERE lost_notified = 0 AND last_seen < ?",
+            (cutoff,),
+        ).fetchall()
+        if lost:
+            conn.executemany(
+                "UPDATE devices SET lost_notified = 1 WHERE mac = ?",
+                [(row["mac"],) for row in lost],
+            )
 
-
-def record_scan_event(conn: sqlite3.Connection, mac: str, rssi: int | None) -> None:
-    conn.execute(
-        "INSERT INTO scan_events (mac, timestamp, rssi) VALUES (?, ?, ?)",
-        (mac, now_iso(), rssi),
-    )
-    conn.commit()
-
-
-def get_newly_lost_devices(conn: sqlite3.Connection, threshold_seconds: int) -> list[sqlite3.Row]:
-    """Return devices that exceeded the lost threshold and haven't been notified yet."""
-    cutoff = datetime.now(timezone.utc).timestamp() - threshold_seconds
-    rows = conn.execute(
-        "SELECT mac, name, last_seen FROM devices WHERE lost_notified = 0"
-    ).fetchall()
-    lost = []
-    for row in rows:
-        last = datetime.fromisoformat(row["last_seen"]).timestamp()
-        if last < cutoff:
-            lost.append(row)
-    return lost
-
-
-def mark_lost_notified(conn: sqlite3.Connection, mac: str) -> None:
-    conn.execute("UPDATE devices SET lost_notified = 1 WHERE mac = ?", (mac,))
-    conn.commit()
-
-
-def record_scan_session(conn: sqlite3.Connection, device_count: int) -> None:
-    conn.execute(
-        "INSERT INTO scan_sessions (timestamp, device_count) VALUES (?, ?)",
-        (now_iso(), device_count),
-    )
-    conn.commit()
+    return new_macs, lost
 
 
 def get_stats(conn: sqlite3.Connection) -> dict:

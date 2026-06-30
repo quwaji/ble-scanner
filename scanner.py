@@ -49,21 +49,17 @@ def log_results(detected: dict[str, tuple[str | None, int | None]], db_results: 
 
 
 def _record_window(conn: sqlite3.Connection, window: dict[str, tuple[str | None, int | None]]) -> None:
-    db_results: dict[str, bool] = {}
-    for mac, (name, rssi) in window.items():
-        is_new = db.upsert_device(conn, mac, name, rssi)
-        db.record_scan_event(conn, mac, rssi)
-        db_results[mac] = is_new
+    # Single batched transaction: committing per device let recording outrun the
+    # scan interval on slow hardware. See db.record_window.
+    new_macs, lost = db.record_window(conn, window, config.LOST_THRESHOLD)
 
+    db_results = {mac: (mac in new_macs) for mac in window}
     logger.info("--- Found %d device(s) ---", len(window))
     log_results(window, db_results)
-    db.record_scan_session(conn, len(window))
 
-    lost = db.get_newly_lost_devices(conn, config.LOST_THRESHOLD)
     for row in lost:
         display_name = row["name"] or "(unknown)"
         logger.info("[LOST] %-17s  %-24s  (last seen: %s)", row["mac"], display_name, row["last_seen"])
-        db.mark_lost_notified(conn, row["mac"])
 
 
 async def scan_loop(conn: sqlite3.Connection) -> None:
