@@ -75,10 +75,15 @@ async def scan_loop(conn: sqlite3.Connection) -> None:
     detected: dict[str, tuple[str | None, int | None]] = {}
 
     def callback(device: BLEDevice, adv: AdvertisementData) -> None:
+        # BlueZ reports -127 dBm (and sometimes None) when it has no valid RSSI
+        # for an advertisement, typically for cached devices that are no longer
+        # nearby. Skip these so the count reflects devices actually in range.
+        if adv.rssi is None or adv.rssi <= -127:
+            return
         mac = device.address.upper()
         name = adv.local_name or device.name or None
         existing_rssi = detected.get(mac, (None, None))[1]
-        if existing_rssi is None or (adv.rssi is not None and adv.rssi > existing_rssi):
+        if existing_rssi is None or adv.rssi > existing_rssi:
             detected[mac] = (name, adv.rssi)
 
     # One passive monitor, started once and kept running. Unlike active discovery,
