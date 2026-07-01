@@ -15,6 +15,11 @@ import db
 
 logger = logging.getLogger(__name__)
 
+# Restart the scanner after this many consecutive zero-device windows.
+# 5 × SCAN_INTERVAL ≈ 2.5 min at default settings — long enough to ignore a
+# genuine gap (tunnel, empty corridor) but short enough to recover quickly.
+_ZERO_RESTART_THRESHOLD = 5
+
 # Passive scanning needs at least one advertisement-monitor pattern. Matching on
 # the common Flags values catches the large majority of advertising BLE devices
 # (phones, wearables, beacons, TVs) without the active-discovery start/stop churn
@@ -101,12 +106,42 @@ async def scan_loop(conn: sqlite3.Connection) -> None:
         return
 
     logger.info("--- Passive monitoring started, sampling every %ds ---", config.SCAN_INTERVAL)
+    consecutive_zeros = 0
     try:
         while True:
             await asyncio.sleep(config.SCAN_INTERVAL)
-            window = dict(detected)
-            detected.clear()
-            _record_window(conn, window)
+            try:
+                window = dict(detected)
+                detected.clear()
+                _record_window(conn, window)
+
+                if len(window) == 0:
+                    consecutive_zeros += 1
+                    if consecutive_zeros >= _ZERO_RESTART_THRESHOLD:
+                        logger.warning(
+                            "Watchdog: %d consecutive empty windows — restarting scanner",
+                            consecutive_zeros,
+                        )
+                        try:
+                            await scanner.stop()
+                        except BleakError as e:
+                            logger.warning("Watchdog: stop failed (ignored): %s", e)
+                        try:
+                            await scanner.start()
+                            consecutive_zeros = 0
+                            logger.info("Watchdog: scanner restarted successfully")
+                        except BleakError as e:
+                            logger.error("Watchdog: restart failed: %s", e)
+                else:
+                    consecutive_zeros = 0
+            except Exception:
+                # A DB error or any other unexpected failure in one iteration must
+                # not break out of the loop and kill the process (and the web UI
+                # with it). Log the traceback and keep scanning. CancelledError /
+                # KeyboardInterrupt derive from BaseException, so they still
+                # propagate for clean shutdown. The watchdog above separately
+                # handles the silent-monitor-stall failure mode.
+                logger.exception("Scan loop iteration failed; continuing")
     finally:
         try:
             await scanner.stop()
